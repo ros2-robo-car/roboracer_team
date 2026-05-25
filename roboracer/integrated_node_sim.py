@@ -20,6 +20,8 @@ import rclpy
 from rclpy.node import Node
 import numpy as np
 import torch
+import threading
+import time
 
 from f110_gym_bridge_interface.msg import Recv, Act
 
@@ -181,7 +183,30 @@ class IntegratedNodeSim(Node):
             f'integrated_node_sim started | obs_dim={self._obs_dim} '
             f'| use_curvature={USE_CURVATURE} | device={self.device}'
         )
-
+        self._initial_act_sent = False
+        threading.Thread(target=self._send_initial_act, daemon=True).start()
+    
+    def _send_initial_act(self):
+        """
+        첫 번째 f110_recv가 도착할 때까지 0.1초 간격으로 직진 명령 발행
+        첫 obs 도착 시 recv_callback에서 _initial_act_sent=True로 루프 종료
+        """
+        time.sleep(0.5)  # 브릿지 연결 대기
+        self.get_logger().info('초기 액션 발행 시작 (Sync 모드 데드락 방지)')
+        while not self._initial_act_sent:
+            try:
+                act_msg = Act()
+                act_msg.steer = 0.0
+                act_msg.speed = REAL_SPEED_MIN
+                self.act_pub.publish(act_msg)
+                time.sleep(0.1)
+            except Exception:
+                break
+        self.get_logger().info('초기 액션 발행 완료 → 정상 루프 시작')
+    
+    
+    
+    
     def _load_waypoints(self):
         try:
             csv = LINE_CONFIG['centerline_csv']
@@ -230,6 +255,9 @@ class IntegratedNodeSim(Node):
         f110_recv 콜백 — 메인 파이프라인
         실차용에서 lidar_callback + odom_callback 역할을 하나로 통합
         """
+
+        self._initial_act_sent = True
+        
         # [STEP 1] LiDAR 전처리 (scans → lidar)
         lidar = self._process_lidar(msg.obs.scans)
 
