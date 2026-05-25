@@ -8,6 +8,7 @@ import torch
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from ackermann_msgs.msg import AckermannDriveStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from config import (
@@ -18,14 +19,15 @@ from sac_model import SAC, get_obs_dim, build_observation
 from waypoint_loader import load_waypoints
 from pure_pursuit import PurePursuitController
 
-# ── 실차 안전 속도 상수 (control_node.py 기준) ────────────────────────────────
-REAL_SPEED_MAX = 3.0    # m/s
-REAL_SPEED_MIN = 0.5    # m/s
-MAX_STEERING   = 0.4189 # rad (~24도)
+# ── 실차 안전 속도 상수 ────────────────────────────────────────────────────────
+REAL_SPEED_MAX = 3.0
+REAL_SPEED_MIN = 0.5
+MAX_STEERING   = 0.4189
 
-# ── 타임아웃 상수 (센서 유실 시 긴급 정지) ────────────────────────────────────
-ODOM_TIMEOUT   = 0.2    # 초 (0.2초 이상 오돔 없으면 긴급 정지)
-SCAN_TIMEOUT   = 0.2    # 초 (0.2초 이상 LiDAR 없으면 긴급 정지)
+# ── 타임아웃 상수 ────────────────────────────────────────────────────────────
+ODOM_TIMEOUT   = 0.2
+SCAN_TIMEOUT   = 0.2
+POSE_TIMEOUT   = 1.0    # /amcl_pose 타임아웃 (amcl은 느리므로 여유있게)
 
 # ── LiDAR / 관측 상수 ────────────────────────────────────────────────────────
 NUM_LINES        = LINE_CONFIG['num_lines']
@@ -36,41 +38,27 @@ USE_CURVATURE    = OBS_CONFIG.get('use_line_curvature', False)
 CURVATURE_MODE   = OBS_CONFIG.get('curvature_mode', 'max')
 CURVATURE_MAX    = OBS_CONFIG.get('curvature_max_value', 1.5)
 OBS_DIM          = get_obs_dim(LIDAR_SIZE, NUM_LINES, use_line_curvature=USE_CURVATURE)
-OBS_DIM_FALLBACK = LIDAR_SIZE  # 웨이포인트 없을 때 fallback
+OBS_DIM_FALLBACK = LIDAR_SIZE
 
 
-# ── 곡률 계산 함수 (train_node.py / eval_node.py 와 동일한 로직) ──────────────
-def _compute_three_point_curvature(p0: np.ndarray,
-                                   p1: np.ndarray,
-                                   p2: np.ndarray) -> float:
-    """세 점으로 곡률 계산 (외접원 반지름의 역수)"""
+def _compute_three_point_curvature(p0, p1, p2):
     d01 = np.linalg.norm(p1 - p0)
     d12 = np.linalg.norm(p2 - p1)
     d02 = np.linalg.norm(p2 - p0)
     denom = d01 * d12 * d02
     if denom < 1e-9:
         return 0.0
-    cross = abs((p1[0] - p0[0]) * (p2[1] - p0[1]) -
-                (p1[1] - p0[1]) * (p2[0] - p0[0]))
+    cross = abs((p1[0]-p0[0])*(p2[1]-p0[1]) - (p1[1]-p0[1])*(p2[0]-p0[0]))
     curvature = 2.0 * cross / denom
-    if not np.isfinite(curvature):
-        return 0.0
-    return float(curvature)
+    return float(curvature) if np.isfinite(curvature) else 0.0
 
 
-def _compute_line_lookahead_curvatures(waypoints_lines: list,
-                                       position: np.ndarray,
-                                       speed: float) -> np.ndarray:
-    """
-    각 라인의 전방 lookahead 구간 곡률을 계산 (train_node.py 로직 이식)
-    반환: shape (NUM_LINES,), 0~1 정규화된 곡률값
-    """
-    # lookahead window 결정 (Pure Pursuit 속도 감속용 window 재사용)
+def _compute_line_lookahead_curvatures(waypoints_lines, position, speed):
     if OBS_CONFIG.get('curvature_use_pp_window', True):
-        base   = int(PURE_PURSUIT_CONFIG.get('lookahead_window_base', 5))
-        scale  = int(PURE_PURSUIT_CONFIG.get('lookahead_window_speed_scale', 2))
-        window = base + int(abs(speed) * scale)
-        sample_step = int(PURE_PURSUIT_CONFIG.get('curvature_sample_step', 2))
+        base        = int(PURE_PURSUIT_CONFIG.get('lookahead_window_base', 5))
+        scale       = int(PURE_PURSUIT_CONFIG.get('lookahead_window_speed_scale', 2))
+        window      = base + int(abs(speed) * scale)
+        sample_step = int(PURE_PURSUIT_CONFIG.get('curvature_sample_step', 2))  # ← 오타 수정
     else:
         window      = int(OBS_CONFIG.get('curvature_lookahead_window', 30))
         sample_step = int(OBS_CONFIG.get('curvature_sample_step', 2))
@@ -79,11 +67,9 @@ def _compute_line_lookahead_curvatures(waypoints_lines: list,
     line_curvatures = []
 
     for waypoints in waypoints_lines:
-        # 현재 위치에서 가장 가까운 waypoint 인덱스 찾기
         dists   = np.linalg.norm(waypoints - position, axis=1)
         nearest = int(np.argmin(dists))
         n_wp    = len(waypoints)
-
         curvatures = []
         for i in range(nearest, min(nearest + window, n_wp - 2), sample_step):
             p0 = waypoints[i]
@@ -98,8 +84,7 @@ def _compute_line_lookahead_curvatures(waypoints_lines: list,
         else:
             line_curvature = float(np.mean(curvatures))
 
-        line_curvature = float(np.clip(line_curvature / max_curv, 0.0, 1.0))
-        line_curvatures.append(line_curvature)
+        line_curvatures.append(float(np.clip(line_curvature / max_curv, 0.0, 1.0)))
 
     return np.array(line_curvatures, dtype=np.float32)
 
@@ -108,35 +93,36 @@ class IntegratedNode(Node):
     """
     Perception + Decision + Control 통합 노드
 
-    파이프라인 (lidar_callback 내부):
-      /scan  ──► _process_lidar()
-                      │
-                      ▼
-               _compute_line_lookahead_curvatures()   ← [추가] 학습과 동일한 곡률 계산
-                      │
-                      ▼
-               build_observation()
-                      │
-                      ▼
-               SAC.select_action()
-               action_to_line_index()
-               PurePursuit.compute()
-               action_to_speed()
-                      │
-                      ▼
-               _publish_drive()
-                      │
-                      ▼
-                   /drive (AckermannDriveStamped)
+    멘토님 피드백 반영:
+      - Localization: /amcl_pose (Particle Filter) 로 정확한 맵 좌표 위치 추정
+      - /amcl_pose 미수신 시 /odom으로 fallback (테스트/개발 편의성)
+      - 속도는 항상 /odom에서 가져옴 (VESC 엔코더 기반)
+      - Mapping: 실차 주행 전 SLAM으로 맵 생성 후 centerline CSV 추출 필요
+      - AMCL 초기 위치 자동 발행 (/initialpose)
 
     안전장치:
-      - 오돔 타임아웃: /odom이 0.2초 이상 끊기면 긴급 정지
-      - LiDAR 타임아웃: /scan이 0.2초 이상 끊기면 긴급 정지
+      - LiDAR 타임아웃: /scan 0.2초 이상 끊기면 긴급 정지
+      - 오돔 타임아웃: /odom 0.2초 이상 끊기면 긴급 정지
+      - Pose 타임아웃: /amcl_pose 수신 후 1.0초 이상 끊기면 긴급 정지
     """
 
     def __init__(self):
         super().__init__('integrated_node')
 
+        # ── 상태 변수 ─────────────────────────────────────────────────────
+        self.position      = np.array([0.0, 0.0])
+        self.heading       = 0.0
+        self.speed         = 0.0
+        self.odom_received = False
+        self.pose_received = False  # /amcl_pose 수신 여부
+
+        # ── 타임아웃 감시용 시각 ──────────────────────────────────────────
+        self.last_odom_time = self.get_clock().now()
+        self.last_scan_time = self.get_clock().now()
+        self.last_pose_time = self.get_clock().now()
+        self.scan_received  = False
+
+        # ── 웨이포인트 로드 (모델보다 먼저!) ──────────────────────────────
         self._load_waypoints()
 
         self.controller = PurePursuitController(
@@ -145,7 +131,7 @@ class IntegratedNode(Node):
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = SAC(
-            OBS_DIM,
+            self._obs_dim,  # _load_waypoints 후에 설정된 값 사용
             MODEL_CONFIG['action_dim'],
             MODEL_CONFIG['hidden_dims'],
             num_lines=NUM_LINES,
@@ -162,24 +148,25 @@ class IntegratedNode(Node):
             self.get_logger().warn(f'모델 없음: {MODEL_SAVE_PATH}')
         self.model.eval()
 
-        self.position      = np.array([0.0, 0.0])
-        self.heading       = 0.0
-        self.speed         = 0.0
-        self.odom_received = False
+        # ── 타임아웃 감시 타이머 (0.1초마다 체크) ─────────────────────────
+        self.timeout_timer = self.create_timer(0.1, self._check_timeouts)
 
-        # ── 센서 타임아웃 안전장치 ────────────────────────────────────────
-        self.last_odom_time = self.get_clock().now()
-        self.last_scan_time = self.get_clock().now()
-        self.scan_received  = False
+        # ── AMCL 초기 위치 발행용 일회성 타이머 ───────────────────────────
+        self.init_pose_timer = self.create_timer(1.5, self._publish_initial_pose)
 
-        # ── /scan 타임아웃 감시 타이머 (0.1초마다 체크) ───────────────────
-        self.timeout_timer = self.create_timer(0.1, self._check_scan_timeout)
-
+        # ── 구독 / 발행 ───────────────────────────────────────────────────
         self.lidar_sub = self.create_subscription(
             LaserScan, '/scan', self.lidar_callback, 10
         )
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self.odom_callback, 10
+        )
+        # /amcl_pose: Particle Filter 기반 정확한 맵 좌표 위치
+        self.pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped, '/amcl_pose', self.pose_callback, 10
+        )
+        self.init_pose_pub = self.create_publisher(
+            PoseWithCovarianceStamped, '/initialpose', 10
         )
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped, '/drive', 10
@@ -189,22 +176,53 @@ class IntegratedNode(Node):
             f'integrated_node started | obs_dim={self._obs_dim} '
             f'| use_curvature={USE_CURVATURE} | device={self.device}'
         )
+        self.get_logger().info(
+            '/amcl_pose 미수신 시 /odom으로 위치 fallback 동작'
+        )
 
-    # ── /scan 타임아웃 감시 (타이머 콜백) ─────────────────────────────────
-    def _check_scan_timeout(self):
+    def _publish_initial_pose(self):
         """
-        /scan이 SCAN_TIMEOUT 이상 안 오면 긴급 정지
-        lidar_callback은 /scan이 와야 호출되므로
-        /scan이 끊기면 콜백 자체가 안 불림 → 별도 타이머로 감시
+        AMCL 노드를 깨우기 위해 초기 위치를 단 한 번 전송
+        실차에서는 실제 출발 좌표로 수정 필요
         """
-        if not self.scan_received:
-            return
-        dt = (self.get_clock().now() - self.last_scan_time).nanoseconds / 1e9
-        if dt > SCAN_TIMEOUT:
-            self.get_logger().error(
-                f'LiDAR 타임아웃! ({dt:.3f}초) 차량을 정지합니다.'
-            )
-            self._publish_drive(0.0, 0.0)
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        msg.pose.pose.position.x    = 0.0
+        msg.pose.pose.position.y    = 0.0
+        msg.pose.pose.position.z    = 0.0
+        msg.pose.pose.orientation.x = 0.0
+        msg.pose.pose.orientation.y = 0.0
+        msg.pose.pose.orientation.z = 0.0
+        msg.pose.pose.orientation.w = 1.0
+        cov = [0.0] * 36
+        cov[0]  = 0.25   # x 오차
+        cov[7]  = 0.25   # y 오차
+        cov[35] = 0.06   # yaw 오차
+        msg.pose.covariance = cov
+        self.init_pose_pub.publish(msg)
+        self.get_logger().info('AMCL 초기 위치(/initialpose) 자동 발행 완료!')
+        self.init_pose_timer.destroy()  # 한 번만 실행
+
+    def _check_timeouts(self):
+        """LiDAR, odom, amcl_pose 타임아웃 감시"""
+        now = self.get_clock().now()
+
+        if self.scan_received:
+            dt_scan = (now - self.last_scan_time).nanoseconds / 1e9
+            if dt_scan > SCAN_TIMEOUT:
+                self.get_logger().error(
+                    f'LiDAR 타임아웃! ({dt_scan:.3f}초) 차량을 정지합니다.'
+                )
+                self._publish_drive(0.0, 0.0, force_stop=True)
+
+        if self.pose_received:
+            dt_pose = (now - self.last_pose_time).nanoseconds / 1e9
+            if dt_pose > POSE_TIMEOUT:
+                self.get_logger().error(
+                    f'Localization 타임아웃! ({dt_pose:.3f}초) 차량을 정지합니다.'
+                )
+                self._publish_drive(0.0, 0.0, force_stop=True)
 
     def _load_waypoints(self):
         try:
@@ -231,7 +249,11 @@ class IntegratedNode(Node):
             self.waypoints_lines = None
             self._obs_dim = OBS_DIM_FALLBACK
 
-    def odom_callback(self, msg: Odometry):
+    def pose_callback(self, msg: PoseWithCovarianceStamped):
+        """
+        /amcl_pose 콜백 — Particle Filter 기반 맵 좌표계 위치/방향
+        SLAM 맵 위에서 현재 차량의 정확한 위치를 제공
+        """
         self.position[0] = msg.pose.pose.position.x
         self.position[1] = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
@@ -239,10 +261,28 @@ class IntegratedNode(Node):
             2.0 * (q.w * q.z + q.x * q.y),
             1.0 - 2.0 * (q.y ** 2 + q.z ** 2),
         )
+        self.pose_received  = True
+        self.last_pose_time = self.get_clock().now()
+
+    def odom_callback(self, msg: Odometry):
+        """
+        /odom 콜백
+        - 속도는 항상 /odom에서 가져옴 (VESC 엔코더 기반, 실시간)
+        - 위치/방향은 /amcl_pose 미수신 시에만 fallback으로 사용
+        """
         self.speed         = msg.twist.twist.linear.x
         self.odom_received = True
-        # ── 최신 오돔 수신 시각 갱신 ─────────────────────────────────────
         self.last_odom_time = self.get_clock().now()
+
+        # /amcl_pose 미수신 시 odom으로 위치/방향 fallback
+        if not self.pose_received:
+            self.position[0] = msg.pose.pose.position.x
+            self.position[1] = msg.pose.pose.position.y
+            q = msg.pose.pose.orientation
+            self.heading = np.arctan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y ** 2 + q.z ** 2),
+            )
 
     def _process_lidar(self, msg: LaserScan) -> np.ndarray:
         ranges = np.array(msg.ranges, dtype=np.float32)
@@ -252,39 +292,35 @@ class IntegratedNode(Node):
         step   = max(1, len(ranges) // LIDAR_SIZE)
         ranges = ranges[::step][:LIDAR_SIZE]
         if len(ranges) < LIDAR_SIZE:
-            ranges = np.pad(
-                ranges, (0, LIDAR_SIZE - len(ranges)), constant_values=1.0
-            )
+            ranges = np.pad(ranges, (0, LIDAR_SIZE - len(ranges)), constant_values=1.0)
         return ranges
 
     def lidar_callback(self, msg: LaserScan):
-        # ── 최신 LiDAR 수신 시각 갱신 ────────────────────────────────────
         self.last_scan_time = self.get_clock().now()
         self.scan_received  = True
 
-        # ── 오돔 타임아웃 체크 (안전장치) ────────────────────────────────
-        # 오돔이 ODOM_TIMEOUT(0.2초) 이상 안 오면 즉시 정지
-        dt = (self.get_clock().now() - self.last_odom_time).nanoseconds / 1e9
-        if self.odom_received and dt > ODOM_TIMEOUT:
+        # 오돔 타임아웃 체크
+        dt_odom = (self.get_clock().now() - self.last_odom_time).nanoseconds / 1e9
+        if self.odom_received and dt_odom > ODOM_TIMEOUT:
             self.get_logger().error(
-                f'오돔 타임아웃! ({dt:.3f}초) 차량을 정지합니다.'
+                f'오돔 타임아웃! ({dt_odom:.3f}초) 차량을 정지합니다.'
             )
-            self._publish_drive(0.0, 0.0)
+            self._publish_drive(0.0, 0.0, force_stop=True)
             return
 
-        # [STEP 1] LiDAR 전처리
-        lidar = self._process_lidar(msg)
-
+        # odom 미수신 시 대기 (/amcl_pose 미수신은 odom fallback으로 허용)
         if not self.odom_received or self.waypoints_lines is None:
             return
 
-        # 레이스 컨디션 방지용 스냅샷
+        # 스냅샷 (레이스 컨디션 방지)
         position_snapshot = self.position.copy()
         heading_snapshot  = float(self.heading)
         speed_snapshot    = float(self.speed)
 
-        # [STEP 2] 곡률 계산 (학습 때와 동일한 방식)
-        # USE_CURVATURE=False면 None → build_observation 내부에서 zeros 처리
+        # [STEP 1] LiDAR 전처리
+        lidar = self._process_lidar(msg)
+
+        # [STEP 2] 곡률 계산
         line_curvatures = None
         if USE_CURVATURE:
             line_curvatures = _compute_line_lookahead_curvatures(
@@ -327,9 +363,13 @@ class IntegratedNode(Node):
         # [STEP 6] /drive 발행
         self._publish_drive(steering, final_speed)
 
-    def _publish_drive(self, steering: float, speed: float):
-        steering = float(np.clip(steering, -MAX_STEERING,   MAX_STEERING))
-        speed    = float(np.clip(speed,     REAL_SPEED_MIN, REAL_SPEED_MAX))
+    def _publish_drive(self, steering: float, speed: float, force_stop: bool = False):
+        steering = float(np.clip(steering, -MAX_STEERING, MAX_STEERING))
+
+        if force_stop:
+            speed = 0.0
+        else:
+            speed = float(np.clip(speed, REAL_SPEED_MIN, REAL_SPEED_MAX))
 
         drive_msg = AckermannDriveStamped()
         drive_msg.header.stamp         = self.get_clock().now().to_msg()
