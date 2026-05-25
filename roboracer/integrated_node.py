@@ -23,6 +23,10 @@ REAL_SPEED_MAX = 3.0    # m/s
 REAL_SPEED_MIN = 0.5    # m/s
 MAX_STEERING   = 0.4189 # rad (~24도)
 
+# ── 타임아웃 상수 (센서 유실 시 긴급 정지) ────────────────────────────────────
+ODOM_TIMEOUT   = 0.2    # 초 (0.2초 이상 오돔 없으면 긴급 정지)
+SCAN_TIMEOUT   = 0.2    # 초 (0.2초 이상 LiDAR 없으면 긴급 정지)
+
 # ── LiDAR / 관측 상수 ────────────────────────────────────────────────────────
 NUM_LINES        = LINE_CONFIG['num_lines']
 LIDAR_SIZE       = OBS_CONFIG['lidar_size']
@@ -124,6 +128,10 @@ class IntegratedNode(Node):
                       │
                       ▼
                    /drive (AckermannDriveStamped)
+
+    안전장치:
+      - 오돔 타임아웃: /odom이 0.2초 이상 끊기면 긴급 정지
+      - LiDAR 타임아웃: /scan이 0.2초 이상 끊기면 긴급 정지
     """
 
     def __init__(self):
@@ -159,6 +167,14 @@ class IntegratedNode(Node):
         self.speed         = 0.0
         self.odom_received = False
 
+        # ── 센서 타임아웃 안전장치 ────────────────────────────────────────
+        self.last_odom_time = self.get_clock().now()
+        self.last_scan_time = self.get_clock().now()
+        self.scan_received  = False
+
+        # ── /scan 타임아웃 감시 타이머 (0.1초마다 체크) ───────────────────
+        self.timeout_timer = self.create_timer(0.1, self._check_scan_timeout)
+
         self.lidar_sub = self.create_subscription(
             LaserScan, '/scan', self.lidar_callback, 10
         )
@@ -173,6 +189,22 @@ class IntegratedNode(Node):
             f'integrated_node started | obs_dim={self._obs_dim} '
             f'| use_curvature={USE_CURVATURE} | device={self.device}'
         )
+
+    # ── /scan 타임아웃 감시 (타이머 콜백) ─────────────────────────────────
+    def _check_scan_timeout(self):
+        """
+        /scan이 SCAN_TIMEOUT 이상 안 오면 긴급 정지
+        lidar_callback은 /scan이 와야 호출되므로
+        /scan이 끊기면 콜백 자체가 안 불림 → 별도 타이머로 감시
+        """
+        if not self.scan_received:
+            return
+        dt = (self.get_clock().now() - self.last_scan_time).nanoseconds / 1e9
+        if dt > SCAN_TIMEOUT:
+            self.get_logger().error(
+                f'LiDAR 타임아웃! ({dt:.3f}초) 차량을 정지합니다.'
+            )
+            self._publish_drive(0.0, 0.0)
 
     def _load_waypoints(self):
         try:
@@ -209,6 +241,8 @@ class IntegratedNode(Node):
         )
         self.speed         = msg.twist.twist.linear.x
         self.odom_received = True
+        # ── 최신 오돔 수신 시각 갱신 ─────────────────────────────────────
+        self.last_odom_time = self.get_clock().now()
 
     def _process_lidar(self, msg: LaserScan) -> np.ndarray:
         ranges = np.array(msg.ranges, dtype=np.float32)
@@ -224,6 +258,20 @@ class IntegratedNode(Node):
         return ranges
 
     def lidar_callback(self, msg: LaserScan):
+        # ── 최신 LiDAR 수신 시각 갱신 ────────────────────────────────────
+        self.last_scan_time = self.get_clock().now()
+        self.scan_received  = True
+
+        # ── 오돔 타임아웃 체크 (안전장치) ────────────────────────────────
+        # 오돔이 ODOM_TIMEOUT(0.2초) 이상 안 오면 즉시 정지
+        dt = (self.get_clock().now() - self.last_odom_time).nanoseconds / 1e9
+        if self.odom_received and dt > ODOM_TIMEOUT:
+            self.get_logger().error(
+                f'오돔 타임아웃! ({dt:.3f}초) 차량을 정지합니다.'
+            )
+            self._publish_drive(0.0, 0.0)
+            return
+
         # [STEP 1] LiDAR 전처리
         lidar = self._process_lidar(msg)
 
